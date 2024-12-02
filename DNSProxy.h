@@ -104,7 +104,8 @@ public:
 
     void Start() {
         // Why should DNS Proxy use a fixed local IP for its purpose?
-        // Since its not possible to track the calling process at network layer, there are two way to avoid recursive entrace
+        // Since its not possible to track the calling process at network layer, there are multiple way to avoid recursive entrace.
+        // We are opting #2 for the prototyping phase.
         // 1. Create another thread that does WinDivertRecv at the socket, keep track of ip tuple and process info. 
         //    Use this info while processing the packet at the network layer to find the initiating process. 
         //    Avoid processing the packet if its coming from this proxy process.
