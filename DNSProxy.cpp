@@ -12,6 +12,28 @@
 #include <condition_variable>
 #include "DNSProxy.h"
 
+// TBD: replace this with proper logging later. 
+#define VERBOSE_LOG 0
+
+// DNS Header structure
+#pragma pack(push, 1)
+struct DNSHeader {
+    uint16_t id;
+    uint16_t flags;
+    uint16_t qdcount;
+    uint16_t ancount;
+    uint16_t nscount;
+    uint16_t arcount;
+};
+#pragma pack(pop)
+
+// DNS Question structure
+struct DNSQuestion {
+    uint16_t qtype;
+    uint16_t qclass;
+};
+
+
 void DNSProxy::PacketCaptureThread() {
     std::string filter = "udp.DstPort == 53 && !loopback";
     divertHandle = WinDivertOpen(filter.c_str(), WINDIVERT_LAYER_NETWORK, 0, WINDIVERT_FLAG_SNIFF);
@@ -37,8 +59,6 @@ void DNSProxy::PacketCaptureThread() {
         if (GetRequestLocalAddr(reinterpret_cast<const char*>(packetBuffer.data()), packetLen, localIP, localPort)) {
             if (IsDNSRequestIssuedByCurrentProcess(localIP, localPort)) {
                 std::cout << "[PCThread] Reentrance Detected. Skipping packet from DNSProxy from socket " << localIP << "::" << localPort << std::endl;
-                //std::cout << "[PCThread] Checksum[2] = " << WinDivertHelperCalcChecksums(packetBuffer.data(), packetBuffer.size(), &addr, 0)
-                //    << std::endl;
                 uint32_t sendLen = 0;
                 auto ret = WinDivertSend(divertHandle, packetBuffer.data(), packetBuffer.size(), &sendLen, &addr);
                 if (!ret) {
@@ -69,18 +89,18 @@ void DNSProxy::PacketProcessingThread() {
         auto [packetData, addr] = requestQueue.dequeue();
 
         DNSPacket originalPacket, responsePacket;
+        // Initialize headers before use
+        memset(&responsePacket.ipHeader, 0, sizeof(WINDIVERT_IPHDR));
+        memset(&responsePacket.udpHeader, 0, sizeof(WINDIVERT_UDPHDR));
+
         if (!ParseDNSPacket(reinterpret_cast<const char*>(packetData.data()), packetData.size(), originalPacket)) {
             continue;
         }
 
         if (ResolveDNSQuery(originalPacket, responsePacket)) {
             std::cout << "[PPThread] ResolveDNS(from 8.8.8.8) successful" << std::endl;
-
             ReconstructDNSResponse(originalPacket, responsePacket);
-
             std::cout << "[PPThread] Reconstruct DNSResponse finished" << std::endl;
-
-            // Prepare a complete packet buffer
 
             // Calculate IP and UDP header lengths
             UINT ipHdrLen = sizeof(WINDIVERT_IPHDR);
@@ -94,8 +114,44 @@ void DNSProxy::PacketProcessingThread() {
             // Update UDP header length
             responsePacket.udpHeader.Length = htons(udpHdrLen + payloadLen);
 
+            responsePacket.ipHeader.Version = 4; // IPv4 
+            responsePacket.ipHeader.HdrLength = 5; // 5 * 4 = 20 bytes 
+            responsePacket.ipHeader.TOS = 0; 
+            responsePacket.ipHeader.Length = htons(ipHdrLen + udpHdrLen + payloadLen); 
+            responsePacket.ipHeader.Id = htons(54321); // Example ID 
+            responsePacket.ipHeader.FragOff0 = 0;
+            responsePacket.ipHeader.TTL = 64; // Typical value 
+            responsePacket.ipHeader.Protocol = IPPROTO_UDP; 
+            responsePacket.ipHeader.Checksum = 0; // Will be filled in by checksum calculation
+
+#if VERBOSE_LOG
+            // Print detailed IP header fields
+            std::cout << "IP Header:" << std::endl;
+            std::cout << "  Version: " << (responsePacket.ipHeader.Version << 4) << std::endl;
+            std::cout << "  HeaderLength: " << responsePacket.ipHeader.HdrLength << std::endl;
+            std::cout << "  TOS: " << responsePacket.ipHeader.TOS << std::endl;
+            std::cout << "  Length: " << ntohs(responsePacket.ipHeader.Length) << std::endl;
+            std::cout << "  ID: " << ntohs(responsePacket.ipHeader.Id) << std::endl;
+            std::cout << "  Flags: " << responsePacket.ipHeader.FragOff0 << std::endl;
+            std::cout << "  TTL: " << (int)responsePacket.ipHeader.TTL << std::endl;
+            std::cout << "  Protocol: " << (int)responsePacket.ipHeader.Protocol << std::endl;
+            std::cout << "  Checksum: " << ntohs(responsePacket.ipHeader.Checksum) << std::endl;
+
+            char srcIpStr[INET_ADDRSTRLEN]; char dstIpStr[INET_ADDRSTRLEN]; 
+            inet_ntop(AF_INET, &responsePacket.ipHeader.SrcAddr, srcIpStr, INET_ADDRSTRLEN); 
+            inet_ntop(AF_INET, &responsePacket.ipHeader.DstAddr, dstIpStr, INET_ADDRSTRLEN); 
+            std::cout << " SrcAddr: " << srcIpStr << std::endl; 
+            std::cout << " DstAddr: " << dstIpStr << std::endl;
+
+            // Print detailed UDP header fields
+            std::cout << "UDP Header:" << std::endl;
+            std::cout << "  SrcPort: " << ntohs(responsePacket.udpHeader.SrcPort) << std::endl;
+            std::cout << "  DstPort: " << ntohs(responsePacket.udpHeader.DstPort) << std::endl;
+            std::cout << "  Length: " << ntohs(responsePacket.udpHeader.Length) << std::endl;
+            std::cout << "  Checksum: " << ntohs(responsePacket.udpHeader.Checksum) << std::endl;
+#endif
             // Construct packet
-            std::vector<BYTE> packetBuffer(MAX_PACKET_SIZE);
+            std::vector<BYTE> packetBuffer(totalLen);  // Adjust buffer size to total length
             BYTE* ptr = packetBuffer.data();
 
             // Copy IP header
@@ -112,12 +168,8 @@ void DNSProxy::PacketProcessingThread() {
             // Prepare address
             WINDIVERT_ADDRESS sendAddr = addr;
             sendAddr.Outbound = 0;  // Ensure outbound is set to 0
-
-            // ----------------------------------------------------------------------------------------------------------
-            // ****BUG****: TBD- PACKET formatting is not correct****...Debug print to troubleshoot fields in DNS response.
-            // 1. Clearly DNS response that we are creating is much smaller.
-            // 2. Understand other fields in the response and fill them in correctly.
-            // ----------------------------------------------------------------------------------------------------------
+#if VERBOSE_LOG
+            // Print packet details
             std::cout << "[PPThread] Sending packet:" << std::endl;
             std::cout << "  Total Length: " << totalLen << std::endl;
             std::cout << "  IP Length: " << ntohs(responsePacket.ipHeader.Length) << std::endl;
@@ -132,34 +184,25 @@ void DNSProxy::PacketProcessingThread() {
                 << ((responsePacket.ipHeader.DstAddr >> 24) & 0xFF) << std::endl;
             std::cout << "  Payload Size: " << payloadLen << std::endl;
 
-            // BUG: These checksums are incorrect. Fix the checksums in order to build a valid response.
-            std::cout << " Checksum1 = " << WinDivertHelperCalcChecksums(packetBuffer.data(), totalLen, &sendAddr,
-                WINDIVERT_HELPER_NO_IP_CHECKSUM
-            ) << " Checksum2 = " << WinDivertHelperCalcChecksums(packetBuffer.data(), totalLen, &sendAddr,
-                WINDIVERT_HELPER_NO_ICMP_CHECKSUM
-            ) << " Checksum3 = " << WinDivertHelperCalcChecksums(packetBuffer.data(), totalLen, &sendAddr,
-                WINDIVERT_HELPER_NO_TCP_CHECKSUM
-            ) << " Checksum4 = " << WinDivertHelperCalcChecksums(packetBuffer.data(), totalLen, &sendAddr,
-                WINDIVERT_HELPER_NO_UDP_CHECKSUM
-            ) << std::endl;
+            // Print raw packet data for verification
+            std::cout << "Raw Packet Data:" << std::endl;
+            for (size_t i = 0; i < totalLen; ++i) {
+                std::printf("%02X ", packetBuffer[i]);
+            }
+            std::cout << std::endl;
+#endif
 
-            //std::cout << "Checksum01 = " << WinDivertHelperCalcChecksums(originalPacket.payload.data(), totalLen, &sendAddr,
-            //    WINDIVERT_HELPER_NO_IP_CHECKSUM
-            //) << "Checksum02 = " << WinDivertHelperCalcChecksums(originalPacket.payload.data(), totalLen, &sendAddr,
-            //    WINDIVERT_HELPER_NO_ICMP_CHECKSUM
-            //) << "Checksum03 = " << WinDivertHelperCalcChecksums(originalPacket.payload.data(), totalLen, &sendAddr,
-            //    WINDIVERT_HELPER_NO_TCP_CHECKSUM
-            //) << "Checksum04 = " << WinDivertHelperCalcChecksums(originalPacket.payload.data(), totalLen, &sendAddr,
-            //    WINDIVERT_HELPER_NO_UDP_CHECKSUM
-            //)
-            //    << std::endl;
+            // Calculate and apply checksums for the packet
+            if (!WinDivertHelperCalcChecksums(packetBuffer.data(), totalLen, &sendAddr, 0)) {
+                std::cerr << "[PPThread] Checksum calculation failed. Verify the packet structure and ensure the headers are correctly formatted." << std::endl;
+                return;
+            }
 
             // Send the packet
             UINT sendLen = totalLen;
             auto ret = WinDivertSend(divertHandle, packetBuffer.data(), sendLen, &sendLen, &sendAddr);
             if (!ret) {
                 DWORD error = GetLastError();
-                std::cerr << "[PPThread] Error in WinDivertSend: " << error << std::endl;
                 // Additional diagnostics
                 char errorBuffer[256];
                 FormatMessageA(
@@ -171,15 +214,15 @@ void DNSProxy::PacketProcessingThread() {
                     sizeof(errorBuffer),
                     NULL
                 );
-                std::cerr << "[PPThread] Error in WinDivertSend. Err = " << error << " Error message : " << errorBuffer << std::endl;
+                std::cerr << "[PPThread] Error in WinDivertSend. Err = " << error << " Error message: " << errorBuffer << std::endl;
             }
             else {
                 std::cout << "[PPThread] WinDivertSend finished" << std::endl;
             }
         }
         else {
+            // Drop the packet if we could not resolve the DNS query using our DNS server.
             std::cout << "[PPThread] Reconstruct DNSResponse failed..." << std::endl;
-            // drop the packet if we could not resolve the DNS query using our DNS server.
         }
     }
 }
@@ -263,8 +306,16 @@ bool DNSProxy::GetRequestLocalAddr(const char* packet, const size_t& packetLen, 
 bool DNSProxy::ParseDNSPacket(const char* packet, size_t packetLen, DNSPacket& parsedPacket) {
     WINDIVERT_IPHDR* ipHeader = nullptr;
     WINDIVERT_UDPHDR* udpHeader = nullptr;
-    UINT* dnsPayload = nullptr;
+    uint8_t* dnsPayload = nullptr;
     UINT dnsPayloadLen = 0;
+
+#if VERBOSE_LOG
+    std::cout << "Raw DNS packet data:" << std::endl;
+    for (size_t i = 0; i < packetLen; ++i) {
+        std::printf("%02X ", static_cast<unsigned char>(packet[i]));
+    }
+    std::cout << std::endl;
+#endif
 
     if (!WinDivertHelperParsePacket(packet, packetLen,
         &ipHeader, nullptr, nullptr, nullptr,
@@ -284,6 +335,19 @@ bool DNSProxy::ParseDNSPacket(const char* packet, size_t packetLen, DNSPacket& p
         dnsPayload + dnsPayloadLen
         );
 
+#if VERBOSE_LOG
+    {
+        auto* header = reinterpret_cast<DNSHeader*>(parsedPacket.payload.data());
+        std::cout << "(MUST MATCH)Parsed DNS Header:" << std::endl;
+        std::cout << " ID: " << ntohs(header->id) << std::endl;
+        std::cout << " Flags: " << ntohs(header->flags) << std::endl;
+        std::cout << " Questions: " << ntohs(header->qdcount) << std::endl;
+        std::cout << " Answer RRs: " << ntohs(header->ancount) << std::endl;
+        std::cout << " Authority RRs: " << ntohs(header->nscount) << std::endl;
+        std::cout << " Additional RRs: " << ntohs(header->arcount) << std::endl;
+    }
+#endif
+
     // Convert IP addresses to human-readable form
     char srcIp[INET_ADDRSTRLEN], dstIp[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &ipHeader->SrcAddr, srcIp, INET_ADDRSTRLEN);
@@ -293,19 +357,78 @@ bool DNSProxy::ParseDNSPacket(const char* packet, size_t packetLen, DNSPacket& p
     std::cout << "[PPThread] Processing DNS request " << srcIp
         << "::" << ntohs(udpHeader->SrcPort) << " ==>> " << dstIp
         << "::" << ntohs(udpHeader->DstPort) << std::endl;
+
     return true;
 }
 
 // Issue to DNS request to 8.8.8.8 and get the response back.
-bool DNSProxy::ResolveDNSQuery(const DNSPacket& query, DNSPacket& response) {
-    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock == INVALID_SOCKET) {
-        return false;
+bool DNSProxy::ResolveDNSQuery(DNSPacket& query, DNSPacket& response) {
+    WSADATA wsaData; 
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "WSAStartup failed" << std::endl; return false;
+    }
+    
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP); 
+    if (sock == INVALID_SOCKET) { 
+        std::cerr << "Socket creation failed" << std::endl; WSACleanup(); 
+        return false; 
     }
 
+    // Convert IP addresses to human-readable form
+    char srcIp1[INET_ADDRSTRLEN], dstIp1[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &query.ipHeader.SrcAddr, srcIp1, INET_ADDRSTRLEN);
+    inet_ntop(AF_INET, &query.ipHeader.DstAddr, dstIp1, INET_ADDRSTRLEN);
+
+    uint8_t* dnsPayload = query.payload.data();
+    size_t dnsPayloadLen = query.payload.size();
+
+    auto header = reinterpret_cast<DNSHeader*>(dnsPayload);
+
+#if VERBOSE_LOG
+    std::cout << "IP Header: " << srcIp1 << "::" << ntohs(query.udpHeader.SrcPort) << " = >> "
+        << dstIp1 << "::" << ntohs(query.udpHeader.DstPort) << std::endl;
+    std::cout << "DNS Payload Length: " << dnsPayloadLen << std::endl;
+
+    std::cout << "Parsed DNS Header:" << std::endl;
+    std::cout << " ID: " << ntohs(header->id) << std::endl;
+    std::cout << " Flags: " << ntohs(header->flags) << std::endl;
+    std::cout << " Questions: " << ntohs(header->qdcount) << std::endl;
+    std::cout << " Answer RRs: " << ntohs(header->ancount) << std::endl;
+    std::cout << " Authority RRs: " << ntohs(header->nscount) << std::endl;
+    std::cout << " Additional RRs: " << ntohs(header->arcount) << std::endl;
+
+    std::cout << "#####query header: id= " << ntohs(header->id)
+        << " flag= " << ntohs(header->flags)
+        << " qdcount= " << ntohs(header->qdcount)
+        << std::endl;
+
+    // Extract and print the DNS question section
+    size_t offset = sizeof(DNSHeader);
+    for (int i = 0; i < ntohs(header->qdcount); ++i) {
+        std::string domainName;
+        while (dnsPayload[offset] != 0) {
+            int len = dnsPayload[offset];
+            domainName.append((char*)&dnsPayload[offset + 1], len);
+            domainName.append(".");
+            offset += len + 1;
+        }
+        offset += 1;  // Skip the null byte
+
+        uint16_t qtype = ntohs(*reinterpret_cast<uint16_t*>(&dnsPayload[offset]));
+        offset += 2;
+        uint16_t qclass = ntohs(*reinterpret_cast<uint16_t*>(&dnsPayload[offset]));
+        offset += 2;
+
+        std::cout << "DNS Question:" << std::endl;
+        std::cout << " Domain Name: " << domainName << std::endl;
+        std::cout << " QTYPE: " << qtype << std::endl;
+        std::cout << " QCLASS: " << qclass << std::endl;
+    }
+#endif
     sockaddr_in dnsServer = {};
     dnsServer.sin_family = AF_INET;
     dnsServer.sin_port = htons(53);
+    inet_pton(AF_INET, DNS_SERVER, &dnsServer.sin_addr);
 
     // Bind the socket to a local address and port (optional step)
     struct sockaddr_in bindAddr;
@@ -321,11 +444,9 @@ bool DNSProxy::ResolveDNSQuery(const DNSPacket& query, DNSPacket& response) {
         return 1;
     }
 
-    inet_pton(AF_INET, DNS_SERVER, &dnsServer.sin_addr);
+    // Get the local address and port after binding
     struct sockaddr_in localAddr;
     int addrLen = sizeof(localAddr);
-
-    // Get the local address and port after binding
     if (getsockname(sock, (struct sockaddr*)&localAddr, &addrLen) == SOCKET_ERROR) {
         std::cerr << "[PPThread] getsockname failed" << std::endl;
         closesocket(sock);
@@ -345,6 +466,9 @@ bool DNSProxy::ResolveDNSQuery(const DNSPacket& query, DNSPacket& response) {
     std::cout << "[PPThread] Resolving DNS query (from 8.8.8.8) using local socket " << ipStr << "::" <<
         ntohs(localAddr.sin_port) << std::endl;
 
+#if VERBOSE_LOG
+    std::cout << "#####DNS Query length = " << query.payload.size() << std::endl;
+#endif
     int sendResult = sendto(sock,
         reinterpret_cast<const char*>(query.payload.data()),
         query.payload.size(),
@@ -352,7 +476,7 @@ bool DNSProxy::ResolveDNSQuery(const DNSPacket& query, DNSPacket& response) {
         reinterpret_cast<sockaddr*>(&dnsServer),
         sizeof(dnsServer)
     );
-
+    
     if (sendResult == SOCKET_ERROR) {
         closesocket(sock);
         return false;
@@ -367,7 +491,12 @@ bool DNSProxy::ResolveDNSQuery(const DNSPacket& query, DNSPacket& response) {
         nullptr
     );
 
+    PrintDNSResponse(responseBuffer, recvLen);
+
     closesocket(sock);
+#if VERBOSE_LOG
+    std::cout << "######DNS response length = " << recvLen << std::endl;
+#endif
 
     if (recvLen <= 0) {
         return false;
@@ -377,6 +506,8 @@ bool DNSProxy::ResolveDNSQuery(const DNSPacket& query, DNSPacket& response) {
         responseBuffer.begin(),
         responseBuffer.begin() + recvLen
         );
+
+    PrintResolvedIPs(response.payload);
 
     return true;
 }
@@ -390,4 +521,119 @@ bool DNSProxy::ReconstructDNSResponse(const DNSPacket& originalQuery, DNSPacket&
     resolvedResponse.udpHeader.DstPort = originalQuery.udpHeader.SrcPort;
 
     return true;
+}
+
+void DNSProxy::PrintResolvedIPs(std::vector<uint8_t>& dnsResponse) {
+#if VERBOSE_LOG
+    // DNS response header is 12 bytes
+    if (dnsResponse.size() < sizeof(DNSHeader)) {
+        return;
+    }
+
+    auto h = reinterpret_cast<DNSHeader*>(dnsResponse.data());
+    auto ans = ntohs(h->ancount);
+    // Check number of answer records
+    uint16_t answerCount = (dnsResponse[6] << 8) | dnsResponse[7];
+
+    size_t offset = sizeof(DNSHeader); // Start after DNS header
+
+    // Skip question section
+    while (offset < dnsResponse.size() && dnsResponse[offset] != 0) {
+        offset += dnsResponse[offset] + 1;
+    }
+    offset++; // Skip null terminator
+    offset += 4; // Skip question type and class
+
+    // Process answer records
+    for (int i = 0; i < answerCount; i++) {
+        // Skip name (could be compressed)
+        if (offset >= dnsResponse.size()) break;
+
+        // Check for compression pointer
+        if (dnsResponse[offset] == 0xC0) {
+            offset += 2; // Skip compression pointer
+        }
+        else {
+            // Skip domain name
+            while (offset < dnsResponse.size() && dnsResponse[offset] != 0) {
+                offset += dnsResponse[offset] + 1;
+            }
+            offset++; // Skip null terminator
+        }
+
+        // Ensure enough bytes for record type, class, TTL, and data length
+        if (offset + 10 > dnsResponse.size()) break;
+
+        // Record Type (2 bytes)
+        uint16_t recordType = (dnsResponse[offset] << 8) | dnsResponse[offset + 1];
+        offset += 2;
+
+        // Class (2 bytes)
+        uint16_t recordClass = (dnsResponse[offset] << 8) | dnsResponse[offset + 1];
+        offset += 2;
+
+        // TTL (4 bytes)
+        offset += 4;
+
+        // Resource Data Length
+        uint16_t dataLength = (dnsResponse[offset] << 8) | dnsResponse[offset + 1];
+        offset += 2;
+
+        // Process A record (IPv4)
+        if (recordType == 1 && dataLength == 4) {
+            if (offset + 4 > dnsResponse.size()) break;
+
+            char ipStr[INET_ADDRSTRLEN];
+            snprintf(ipStr, sizeof(ipStr), "%u.%u.%u.%u",
+                dnsResponse[offset],
+                dnsResponse[offset + 1],
+                dnsResponse[offset + 2],
+                dnsResponse[offset + 3]
+            );
+
+            std::cout << "Resolved IP: " << ipStr << std::endl;
+        }
+
+        offset += dataLength;
+    }
+#endif
+}
+
+void DNSProxy::PrintDNSResponse(const std::vector<uint8_t>& buffer, size_t size) {
+#if VERBOSE_LOG
+    if (size < sizeof(DNSHeader)) {
+        return;
+    }
+
+    const DNSHeader* header = reinterpret_cast<const DNSHeader*>(buffer.data());
+    std::cout << "DNS Header:" << std::endl;
+    std::cout << " ID: " << ntohs(header->id) << std::endl;
+    std::cout << " Flags: " << ntohs(header->flags) << std::endl;
+    std::cout << " Questions: " << ntohs(header->qdcount) << std::endl;
+    std::cout << " Answer RRs: " << ntohs(header->ancount) << std::endl;
+    std::cout << " Authority RRs: " << ntohs(header->nscount) << std::endl;
+    std::cout << " Additional RRs: " << ntohs(header->arcount) << std::endl;
+    size_t offset = sizeof(DNSHeader);
+    if (offset >= size) return;
+
+    // Skip the query section 
+    while (buffer[offset] != 0) {
+        offset++;
+    }
+
+    offset += 5; // null byte + qtype + qclass 
+    std::cout << "DNS Answer Section:" << std::endl;
+    for (int i = 0; i < ntohs(header->ancount); ++i) {
+        if (offset + 10 > size) return;
+        uint16_t type = ntohs(*reinterpret_cast<const uint16_t*>(&buffer[offset + 2]));
+        uint16_t dataLen = ntohs(*reinterpret_cast<const uint16_t*>(&buffer[offset + 8]));
+        if (type == 1 && dataLen == 4) {
+            // A record 
+            const uint8_t* ip = &buffer[offset + 10];
+            std::cout << " IP Address: " << (int)ip[0] << "." << (int)ip[1] << "." << (int)ip[2] << "." << (int)ip[3] << std::endl;
+        }
+        offset += 10 + dataLen;
+    }
+#endif
+
 }

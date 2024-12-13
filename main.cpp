@@ -15,6 +15,7 @@
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Iphlpapi.lib")
 #pragma comment(lib, "Psapi.lib")
+
 /*
 Rushi's TBD: 
 - Use C++ exception handling instead of returning true/false.
@@ -30,7 +31,6 @@ Rushi's TBD:
 - Ensure code formatting is consistent.
 - Code refacoring, cleanup unwanted comments, fix typos, etc.
 */
-
 int main() {
     try {
         DNSProxy proxy;
@@ -51,6 +51,5 @@ int main() {
         std::cerr << "Exception: " << e.what() << std::endl;
         return 1;
     }
-
     return 0;
 }

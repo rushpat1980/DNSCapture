@@ -80,9 +80,10 @@ private:
     bool GetRequestLocalAddr(const char* packet, const size_t& packetLen, uint32_t& localIP, uint32_t& localPort);
     bool ParseDNSResponsePacket(const char* packet, size_t packetLen, DNSPacket& parsedPacket);
     bool ParseDNSPacket(const char* packet, size_t packetLen, DNSPacket& parsedPacket);
-    bool ResolveDNSQuery(const DNSPacket& query, DNSPacket& response);
+    bool ResolveDNSQuery(DNSPacket& query, DNSPacket& response);
+    void PrintResolvedIPs(std::vector<uint8_t>& dnsResponse);
     bool ReconstructDNSResponse(const DNSPacket& originalQuery, DNSPacket& resolvedResponse);
-
+    void PrintDNSResponse(const std::vector<uint8_t>& buffer, size_t size);
 public:
     DNSProxy() {
         // Initialize Winsock: Note: this shall ideally be done only once for a program.
@@ -104,8 +105,7 @@ public:
 
     void Start() {
         // Why should DNS Proxy use a fixed local IP for its purpose?
-        // Since its not possible to track the calling process at network layer, there are multiple way to avoid recursive entrace.
-        // We are opting #2 for the prototyping phase.
+        // Since its not possible to track the calling process at network layer, there are two way to avoid recursive entrace
         // 1. Create another thread that does WinDivertRecv at the socket, keep track of ip tuple and process info. 
         //    Use this info while processing the packet at the network layer to find the initiating process. 
         //    Avoid processing the packet if its coming from this proxy process.
